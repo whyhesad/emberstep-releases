@@ -1,0 +1,78 @@
+name: Publish verified launcher migration
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: signed-launcher-migration
+  cancel-in-progress: false
+jobs:
+  migrate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Verify and publish existing signed launcher
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os,json,hashlib,urllib.request,tempfile,subprocess,time
+          from pathlib import Path
+          repo='whyhesad/emberstep-releases'
+          api='https://api.github.com/repos/'+repo
+          token=os.environ['GH_TOKEN']
+          expected=[{'name': 'Emberstep-Launcher-0.7.6-macos-universal.zip', 'size': 68540940, 'sha256': '5635e004b1c323c450e63312d2dca8272b53f96ab5896c7c3f30f1bea116de12'}, {'name': 'Emberstep-Launcher-0.7.6-windows-x86_64.zip', 'size': 43569417, 'sha256': '79576645e965f51c978f51683182dec21aba436245a0a7cb4e78d423b78b1948'}, {'name': 'launcher-0.7.6-launcher-macos-universal.0000.part', 'size': 179476480, 'sha256': '96eef931cb7d63f3604e6f035feb4f19896e34ee5a188137d3bae87d7a45d9c9'}, {'name': 'launcher-0.7.6-launcher-windows-x86_64.0000.part', 'size': 115056640, 'sha256': '263c9605ecdf8b736195701058b0941cb33ee7e45a102d21251481fb09b31f5c'}, {'name': 'launcher-macos-universal.manifest.json', 'size': 1790, 'sha256': '1cc6eadc48ab6ae90a210b6812dda301c94054efde4126943ed9f38465fa915f'}, {'name': 'launcher-macos-universal.manifest.sig', 'size': 384, 'sha256': '1578b78378ef5e6de32a147e6e910bd98e2e9410f3b60d9489671e6bc24635fb'}, {'name': 'launcher-windows-x86_64.manifest.json', 'size': 869, 'sha256': '09d87fb924e21dac225de4a720a3668575a2dd2a1832cf1aeb1fd1c4e2ee6e6c'}, {'name': 'launcher-windows-x86_64.manifest.sig', 'size': 384, 'sha256': 'e2133d15eeebcbf9aa52cba89278549686386193063d5cf87c627d4ddedfc2ab'}]
+          public_key='-----BEGIN PUBLIC KEY-----\nMIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEA4GB5KoCMlnGCWuz/tVnC\nDk2CpgJoXLT3DqJgmI+skGx4juloPHWAomWPg7INlWx494VVA6x8A+AFuiXoIoB/\nuLKKOdggyUrUh69bq0KXFIrTiaF7m7U6IT5TrvpJh0Eps8vDnXvs9XFlQ1tlUH/R\n9ovIObZpI4nz1Mdsqyv9vKLAPEPubP4CdgkZJng27PI3SapIjbwuCtDZ5CpkMzEh\nzM51Uh9WZ64nou1aX6uM8T2ebKjG//yAO/olrhxV7n1kOtUWbvoOXBvGmCtchyf2\nuZ+Beeod0Ec9TOk8nihnxQK1ynKNpGSFLKNldRq9nxEGenfL+N8Ro2ojwdum/3hN\n8naKb8t0wvIIuKGFwo2h3a9df5C0IRgZ9H6PFcd3032v1DzCe9oCB5CI4RcaDS7I\nK4s4Y13bcQMapgqNoT8JFAmSSKT55u/c6xUiebvqNn70OUoZdg4mFVN0A6reyHZD\n1PCbcqwqiEdmGbdqpwjX/tXL2Q1Ahm/0m4GVTOppS/hbAgMBAAE=\n-----END PUBLIC KEY-----\n'
+
+          def request(url,method='GET',data=None,content_type='application/json'):
+           assert url.startswith(api+'/') or url.startswith('https://uploads.github.com/repos/'+repo+'/')
+           body=json.dumps(data).encode() if isinstance(data,dict) else data
+           req=urllib.request.Request(url,data=body,method=method,headers={'Authorization':'Bearer '+token,'Accept':'application/vnd.github+json','Content-Type':content_type,'User-Agent':'Emberstep-Signed-Launcher-Migration'})
+           with urllib.request.urlopen(req,timeout=300) as r:
+            raw=r.read()
+            return json.loads(raw) if raw else None
+          assert request(api+'/releases/latest')['tag_name']=='v0.1.0-preview.20261015', 'Unexpected latest release'
+          release=request(api+'/releases/422982789')
+          assert release['draft'], 'Only the prepared unpublished draft may be modified'
+          assert release['name']=='Emberstep Launcher 0.7.6 — автообновление старых версий'
+          with tempfile.TemporaryDirectory(prefix='launcher-migration-') as tmp:
+           tmp=Path(tmp);(tmp/'public.pem').write_text(public_key)
+           for item in expected:
+            name=item['name'];source_name=name
+            if name.startswith('launcher-') and name.endswith(('.manifest.json','.manifest.sig')):source_name='launcher-0.7.6-'+name.removeprefix('launcher-')
+            url='https://downloads.emberstep.kontreo.ru/assets/'+source_name
+            h=hashlib.sha256();count=0
+            with urllib.request.urlopen(url,timeout=120) as src,(tmp/name).open('wb') as dst:
+             while b:=src.read(1024*1024):
+              count+=len(b);assert count<=item['size'];dst.write(b);h.update(b)
+            assert count==item['size'] and h.hexdigest()==item['sha256']
+            print('SOURCE_SHA256_PASS',name,flush=True)
+           for platform in ('macos-universal','windows-x86_64'):
+            stem='launcher-'+platform+'.manifest'
+            subprocess.run(['openssl','dgst','-sha256','-verify',str(tmp/'public.pem'),'-signature',str(tmp/(stem+'.sig')),str(tmp/(stem+'.json'))],check=True)
+            m=json.loads((tmp/(stem+'.json')).read_bytes());assert m['version']=='0.7.6' and m['build']==706 and m['product']=='emberstep-launcher'
+           # Remove only failed draft placeholders, never any uploaded or published asset.
+           assets={x['name']:x for x in request(api+'/releases/422982789/assets?per_page=100')}
+           for item in expected:
+            asset=assets.get(item['name'])
+            if asset:
+             if asset['state']=='uploaded':
+              assert asset['size']==item['size'] and asset['digest']=='sha256:'+item['sha256'];continue
+             assert asset['state'] in ('starter','new')
+             request(api+'/releases/assets/'+str(asset['id']),method='DELETE')
+            name=item['name']
+            # Inputs are bounded public launcher files (<180MB), not multi-GB game archives.
+            request('https://uploads.github.com/repos/'+repo+'/releases/422982789/assets?name='+name,method='POST',data=(tmp/name).read_bytes(),content_type='application/octet-stream')
+            print('ASSET_UPLOADED',name,flush=True)
+           assets={x['name']:x for x in request(api+'/releases/422982789/assets?per_page=100')}
+           assert set(assets)=={x['name'] for x in expected}
+           for item in expected:
+            a=assets[item['name']];assert a['state']=='uploaded' and a['size']==item['size'] and a['digest']=='sha256:'+item['sha256']
+            print('REMOTE_DIGEST_VERIFIED',item['name'],flush=True)
+           assert request(api+'/releases/latest')['tag_name']=='v0.1.0-preview.20261015', 'Discovery changed during staging'
+           release=request(api+'/releases/422982789',method='PATCH',data={'tag_name':'launcher-0.7.6-migration.20261025','target_commitish':'main','draft':False,'prerelease':False,'make_latest':'true'})
+           assert not release['draft'] and release['tag_name']=='launcher-0.7.6-migration.20261025'
+           assert request(api+'/releases/latest')['id']==release['id']
+           print('GITHUB_ATOMIC_MIGRATION_PUBLISHED',release['html_url'],flush=True)
+          PY
